@@ -1,0 +1,1 @@
+Gamut boundary LUT (buildGamutLUT / gamutRadius) — 360-entry Float32Array built once via 24-iteration bisection at session start. The binary noise generator now samples gamutRadius(π/2) and gamutRadius(3π/2) to get the exact S+ and S− gamut limits, then scales by noiseContrast (now interpreted as fraction of gamut maximum, 0→1).
