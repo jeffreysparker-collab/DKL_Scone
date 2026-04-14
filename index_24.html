@@ -1,0 +1,1009 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>S-Cone Mapper</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;500&display=swap');
+    * { -webkit-tap-highlight-color: transparent; box-sizing: border-box; }
+    body { overscroll-behavior: none; font-family: 'DM Sans', sans-serif; background: #0a0a0a; color: #fff; }
+    .mono { font-family: 'Space Mono', monospace; }
+    input[type=range] { accent-color: #4ade80; }
+    .safari-120hz { width:1px;height:1px;opacity:0.01;position:fixed;top:0;left:0;pointer-events:none;
+      animation:jitter 0.008333s infinite linear;will-change:transform; }
+    @keyframes jitter{0%,100%{transform:translateY(0)}50%{transform:translateY(0.5px)}}
+    .fixation::before,.fixation::after{content:'';position:absolute;background:#cc4400;border-radius:1px;}
+    .fixation::before{width:2px;height:100%;left:50%;transform:translateX(-50%);}
+    .fixation::after{width:100%;height:2px;top:50%;transform:translateY(-50%);}
+    .fixation{position:relative;width:16px;height:16px;}
+  </style>
+</head>
+<body>
+<div class="safari-120hz"></div>
+<div id="root"></div>
+
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback, useMemo } = React;
+
+// ═══════════════════════════════════════════════════════
+// COLOR PIPELINE — Stockman & Sharpe 2000 (SS2000)
+// Display P3, D65, γ=2.2
+// Pipeline: P3 RGB → linearise → XYZ → SS2000 LMS → DKL
+// ═══════════════════════════════════════════════════════
+
+// Display P3 linear RGB → XYZ (D65, ×100 implicit)
+const M_P3_TO_XYZ = [
+  [0.4866, 0.2657, 0.1982],
+  [0.2290, 0.6917, 0.0793],
+  [0.0000, 0.0451, 1.0439],
+];
+
+// XYZ → Display P3 linear RGB
+const M_XYZ_TO_P3 = [
+  [ 2.4935, -0.9314, -0.4027],
+  [-0.8295,  1.7627,  0.0236],
+  [ 0.0358, -0.0762,  0.9569],
+];
+
+// SS2000 XYZ → LMS (2-deg, D65 normalised) — CIE 170-1:2006
+// Replaces HPE for better S-cone accuracy (~440nm vs HPE approximation)
+const M_XYZ_TO_LMS_SS2000 = [
+  [ 0.210576,  0.855098, -0.0396983],
+  [-0.417076,  1.177260,  0.0786957],
+  [ 0.000000,  0.000000,  0.5165150],
+];
+
+// SS2000 LMS → XYZ (inverse)
+const M_LMS_TO_XYZ_SS2000 = [
+  [ 1.928170, -1.327674,  0.176952],
+  [ 0.681665,  0.359309, -0.002451],
+  [ 0.000000,  0.000000,  1.936070],
+];
+
+function matMul3(M, v) {
+  return [
+    M[0][0]*v[0] + M[0][1]*v[1] + M[0][2]*v[2],
+    M[1][0]*v[0] + M[1][1]*v[1] + M[1][2]*v[2],
+    M[2][0]*v[0] + M[2][1]*v[1] + M[2][2]*v[2],
+  ];
+}
+
+function linearise(c) { return Math.pow(Math.max(0, c), 2.2); }
+function gammaEncode(c) { return Math.pow(Math.max(0, Math.min(1, c)), 1/2.2); }
+
+// P3 [0,1] encoded → LMS (adapted)
+function p3ToLMS(r, g, b) {
+  const lin = [linearise(r), linearise(g), linearise(b)];
+  const xyz = matMul3(M_P3_TO_XYZ, lin);
+  return matMul3(M_XYZ_TO_LMS_SS2000, xyz);
+}
+
+// LMS → P3 [0,1] encoded; returns {rgb, oog}
+function lmsToP3(L, M, S) {
+  const xyz = matMul3(M_LMS_TO_XYZ_SS2000, [L, M, S]);
+  const lin = matMul3(M_XYZ_TO_P3, xyz);
+  const oog = lin[0] < 0 || lin[0] > 1 || lin[1] < 0 || lin[1] > 1 || lin[2] < 0 || lin[2] > 1;
+  return {
+    r: gammaEncode(lin[0]),
+    g: gammaEncode(lin[1]),
+    b: gammaEncode(lin[2]),
+    oog,
+  };
+}
+
+// ─── DKL construction at adaptation point ───
+// Given background P3 RGB, compute adapted LMS (L0,M0,S0)
+// DKL modulation:
+//   L = L0 * (1 + lm_c + lum_c)
+//   M = M0 * (1 - lm_c + lum_c)
+//   S = S0 * (1 + s_c)
+// For S-axis: lm_c = 0, lum_c = 0, only s_c varies
+function bgToLMS0(bgR, bgG, bgB) {
+  return p3ToLMS(bgR/255, bgG/255, bgB/255);
+}
+
+// Generate one patch RGB given DKL (lm_c, s_c)
+// lm_c: L-M axis contrast  (L up, M down)
+// s_c:  S axis contrast
+// For S-only signal: lm_c=0, s_c=signalSc
+function dklPatchToP3(L0, M0, S0, lm_c, s_c) {
+  const L = L0 * (1 + lm_c);
+  const M = M0 * (1 - lm_c);
+  const S = S0 * (1 + s_c);
+  const { r, g, b, oog } = lmsToP3(L, M, S);
+  return {
+    r: Math.round(r * 255),
+    g: Math.round(g * 255),
+    b: Math.round(b * 255),
+    oog,
+  };
+}
+
+// ═══════════════════════════════════════════════════════
+// CONSTANTS
+// ═══════════════════════════════════════════════════════
+
+// Neutral grey background — D65 white point, ~50% luminance
+const BG_P3 = { r: 128, g: 128, b: 128 };
+
+const GRID_N       = 50;          // 50×50 noise grid — more context, less full-mask probability
+const FLASH_MS     = 250;         // stimulus duration per H&G
+const ADAPT_MS     = 1000;        // ISI grey adaptation
+const MAX_REVERSALS = 8;
+const MIN_TRIALS_AFTER_REVERSALS = 20; // don't terminate until at least this many trials post-convergence
+const REVERSALS_PSE = 6;
+const STEP_START    = 0.15;       // S-cone contrast units
+const STEP_MIN      = 0.02;
+const STEP_HALVE_UNTIL = 3;
+const SC_MAX        = 0.5;        // keep in gamut at 25% noise (0.5+0.25=0.75 linear, clips cleanly)
+
+// Eccentricity conditions — avoid 0° (tritanopic foveola)
+const ECC_CONDITIONS = [0.5, 1.0, 2.0, 3.0];
+
+// Constant 5×5 signal patch across all eccentricities.
+// M-scaling would flatten the threshold curve — but the eccentricity effect IS the signal here.
+// Constant size keeps the stimulus fixed so threshold differences reflect S-cone density only.
+const SIGNAL_SIZE = { 0.5: 5, 1.0: 5, 2.0: 5, 3.0: 5 };
+
+// Pixel geometry — iPhone 16 Pro
+const CSS_PX_PER_CM  = (460 / 3) / 2.54;
+const TAN_1_DEG      = Math.tan(Math.PI / 180);
+const distToPxPerDeg = d => d * CSS_PX_PER_CM * TAN_1_DEG;
+const DEFAULT_DIST_CM = 40;
+
+// ═══════════════════════════════════════════════════════
+// GAMUT BOUNDARY LUT
+// P3 gamut is highly asymmetric in DKL space — green direction clips at r≈0.116
+// while red/violet goes to r≈1.96. Pre-compute max in-gamut radius per angle
+// so binary noise can be scaled to the gamut ellipse (no clamping, max contrast).
+// Built once at module load using bgToLMS0 result.
+// ═══════════════════════════════════════════════════════
+const N_GAMUT_ANGLES = 360;
+let GAMUT_RADII = null; // Float32Array, filled by buildGamutLUT()
+
+function buildGamutLUT(L0, M0, S0) {
+  const lut = new Float32Array(N_GAMUT_ANGLES);
+  for (let i = 0; i < N_GAMUT_ANGLES; i++) {
+    const theta = (i / N_GAMUT_ANGLES) * 2 * Math.PI;
+    const cosT = Math.cos(theta), sinT = Math.sin(theta);
+    let lo = 0, hi = 2;
+    for (let k = 0; k < 24; k++) {
+      const mid = (lo + hi) / 2;
+      const { oog } = lmsToP3(L0*(1+mid*cosT), M0*(1-mid*cosT), S0*(1+mid*sinT));
+      if (oog) hi = mid; else lo = mid;
+    }
+    lut[i] = lo * 0.97; // 3% safety margin
+  }
+  GAMUT_RADII = lut;
+}
+
+function gamutRadius(theta) {
+  // Bilinear interpolation in the LUT
+  const t = ((theta % (2*Math.PI)) + 2*Math.PI) % (2*Math.PI);
+  const idx = t / (2*Math.PI) * N_GAMUT_ANGLES;
+  const i0 = Math.floor(idx) % N_GAMUT_ANGLES;
+  const i1 = (i0 + 1) % N_GAMUT_ANGLES;
+  const frac = idx - Math.floor(idx);
+  return GAMUT_RADII[i0] * (1-frac) + GAMUT_RADII[i1] * frac;
+}
+
+// ═══════════════════════════════════════════════════════
+// NOISE GENERATION — 2D chromatic (L-M plane + S axis)
+// Each patch gets an independent (lm_c, s_c) draw, producing the full
+// chromatic range seen in Hansen & Gegenfurtner 2005 (reds, greens,
+// blues, purples from the whole DKL plane).
+// Signal is added only to s_c of signal-region patches.
+//
+// Two modes:
+//   binary:   random angle θ ~ Uniform[0,2π], radius = noiseContrast
+//             → all patches on the chromatic circle, max kernel SNR
+//   gaussian: lm_c ~ N(0,σ), s_c ~ N(0,σ) independently, clipped ±3σ
+//             → varied saturation, richer percept
+//
+// Returns Float32Array length 2×GRID_N² — interleaved [lm, s, lm, s, ...]
+// Kernel computation uses only the s_c component (index 2i+1).
+// ═══════════════════════════════════════════════════════
+function generateNoise(noiseContrast, seed, gaussian = false) {
+  let s = seed >>> 0;
+  const rand = () => {
+    s += 0x6D2B79F5;
+    let t = s;
+    t = Math.imul(t ^ t >>> 15, t | 1);
+    t ^= t + Math.imul(t ^ t >>> 7, t | 61);
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+  const n = GRID_N * GRID_N;
+  const noise = new Float32Array(n * 2); // [lm0, s0, lm1, s1, ...]
+  if (gaussian) {
+    // Independent Gaussian on each axis, clipped at ±3σ.
+    // No gamut scaling needed — tails are rare and bisection clamp handles them.
+    const clip = 3 * noiseContrast;
+    for (let i = 0; i < n; i++) {
+      const u1 = Math.max(1e-10, rand()), u2 = rand();
+      const z1 = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+      const u3 = Math.max(1e-10, rand()), u4 = rand();
+      const z2 = Math.sqrt(-2 * Math.log(u3)) * Math.cos(2 * Math.PI * u4);
+      noise[i * 2]     = Math.max(-clip, Math.min(clip, z1 * noiseContrast));
+      noise[i * 2 + 1] = Math.max(-clip, Math.min(clip, z2 * noiseContrast));
+    }
+  } else {
+    // Binary: random angle, radius scaled to gamut boundary in that direction.
+    // noiseContrast (0–1) is a fraction of the per-angle gamut limit —
+    // 1.0 = maximum displayable contrast, no clamping needed by construction.
+    for (let i = 0; i < n; i++) {
+      const theta = rand() * 2 * Math.PI;
+      const r = gamutRadius(theta) * noiseContrast;
+      noise[i * 2]     = r * Math.cos(theta);
+      noise[i * 2 + 1] = r * Math.sin(theta);
+    }
+  }
+  return noise;
+}
+
+// ═══════════════════════════════════════════════════════
+// CANVAS RENDERER
+// Renders 24×24 DKL noise grid + optional signal patch
+// ═══════════════════════════════════════════════════════
+function renderGrid(canvas, {
+  noise,           // Float32Array interleaved [lm0,s0, lm1,s1, ...] per patch
+  signalSc,        // S contrast of signal (added to s_c only)
+  signalRow,
+  signalCol,
+  signalSize,
+  patchPx,
+  L0, M0, S0,
+  showSignal,
+}) {
+  const ctx = canvas.getContext('2d');
+  const size = GRID_N * patchPx;
+  canvas.width  = size;
+  canvas.height = size;
+
+  ctx.fillStyle = `rgb(${BG_P3.r},${BG_P3.g},${BG_P3.b})`;
+  ctx.fillRect(0, 0, size, size);
+
+  let oogCount = 0;
+  for (let row = 0; row < GRID_N; row++) {
+    for (let col = 0; col < GRID_N; col++) {
+      const idx = row * GRID_N + col;
+      let lm_c = noise[idx * 2];
+      let s_c  = noise[idx * 2 + 1];
+
+      if (showSignal &&
+          row >= signalRow && row < signalRow + signalSize &&
+          col >= signalCol && col < signalCol + signalSize) {
+        s_c += signalSc;
+      }
+
+      // Per-patch gamut clamp: bisect toward origin preserving hue angle
+      let { r, g, b, oog } = dklPatchToP3(L0, M0, S0, lm_c, s_c);
+      if (oog) {
+        oogCount++;
+        let lo = 0, hi = 1;
+        for (let k = 0; k < 8; k++) {
+          const mid = (lo + hi) / 2;
+          const res = dklPatchToP3(L0, M0, S0, lm_c * mid, s_c * mid);
+          if (res.oog) hi = mid; else { lo = mid; r = res.r; g = res.g; b = res.b; }
+        }
+      }
+
+      ctx.fillStyle = `rgb(${r},${g},${b})`;
+      ctx.fillRect(col * patchPx, row * patchPx, patchPx, patchPx);
+    }
+  }
+  return oogCount;
+}
+
+// ═══════════════════════════════════════════════════════
+// STAIRCASE
+// ═══════════════════════════════════════════════════════
+function makeStaircase(startSc) {
+  return {
+    sc: Math.max(0.01, Math.min(SC_MAX, startSc)),
+    stepSize: STEP_START,
+    direction: null,
+    consecutiveCorrect: 0,
+    reversals: [],
+    done: false,
+    trials: [],
+  };
+}
+
+// 1-up 2-down staircase on percent-correct across all trials (signal + catch).
+// correct=true  → hit or correct rejection → 2 consecutive → step down (harder)
+// correct=false → miss or false alarm     → step up immediately (easier)
+// Targets ~71% correct, which in a yes/no task with β≈0 corresponds to d'≈1.
+function staircaseUpdate(sc, correct) {
+  const s = { ...sc, reversals: [...sc.reversals], trials: [...sc.trials] };
+  s.trials.push({ sc: s.sc, correct });
+
+  if (!correct) {
+    // Wrong answer — step UP (more S-contrast, easier to see)
+    s.consecutiveCorrect = 0;
+    if (s.direction === 'down') {
+      s.reversals.push(s.sc);
+      if (s.reversals.length <= STEP_HALVE_UNTIL)
+        s.stepSize = Math.max(STEP_MIN, s.stepSize / 2);
+    }
+    s.direction = 'up';
+    s.sc = Math.min(SC_MAX, s.sc + s.stepSize);
+  } else {
+    // Correct — need 2 consecutive before stepping DOWN (less contrast)
+    s.consecutiveCorrect += 1;
+    if (s.consecutiveCorrect >= 2) {
+      s.consecutiveCorrect = 0;
+      if (s.direction === 'up') {
+        s.reversals.push(s.sc);
+        if (s.reversals.length <= STEP_HALVE_UNTIL)
+          s.stepSize = Math.max(STEP_MIN, s.stepSize / 2);
+      }
+      s.direction = 'down';
+      s.sc = Math.max(0.01, s.sc - s.stepSize);
+    }
+  }
+
+  s.done = s.reversals.length >= MAX_REVERSALS && s.trials.length >= MIN_TRIALS_AFTER_REVERSALS;
+  return { nextState: s };
+}
+
+function staircaseThreshold(sc) {
+  const rev = sc.reversals.slice(-REVERSALS_PSE);
+  if (rev.length === 0) return sc.sc;
+  return rev.reduce((a, b) => a + b, 0) / rev.length;
+}
+
+function staircaseSD(sc) {
+  const rev = sc.reversals.slice(-REVERSALS_PSE);
+  if (rev.length < 2) return 0;
+  const mean = rev.reduce((a, b) => a + b, 0) / rev.length;
+  return Math.sqrt(rev.reduce((a, b) => a + (b - mean) ** 2, 0) / (rev.length - 1));
+}
+
+// ═══════════════════════════════════════════════════════
+// KERNEL ANALYSIS
+// K(x,y) = mean_noise(seen trials) - mean_noise(not-seen trials)
+// η = ||K_human||² / ||K_ideal||²
+// ═══════════════════════════════════════════════════════
+function computeKernel(trials, noiseContrast, gaussian) {
+  const n = GRID_N * GRID_N;
+  const sumSeen    = new Float64Array(n);
+  const sumNotSeen = new Float64Array(n);
+  let countSeen = 0, countNotSeen = 0;
+
+  for (const t of trials) {
+    const noise = generateNoise(noiseContrast, t.seed, gaussian);
+    // Sort by RESPONSE (yes/no), not by correctness or signal presence.
+    // Classification image: K = mean_noise(said YES) - mean_noise(said NO)
+    // Kernel uses s_c component only (index 2i+1) — that's the S-axis signal dimension
+    if (t.choseSeen) {
+      for (let i = 0; i < n; i++) sumSeen[i] += noise[i * 2 + 1];
+      countSeen++;
+    } else {
+      for (let i = 0; i < n; i++) sumNotSeen[i] += noise[i * 2 + 1];
+      countNotSeen++;
+    }
+  }
+
+  const K = new Float64Array(n);
+  if (countSeen > 0 && countNotSeen > 0) {
+    for (let i = 0; i < n; i++) {
+      K[i] = (sumSeen[i] / countSeen) - (sumNotSeen[i] / countNotSeen);
+    }
+  }
+  return K;
+}
+
+function computeEta(K, signalRow, signalCol, signalSize, signalSc) {
+  // Ideal kernel = signal patch pattern (uniform signalSc in signal region, 0 elsewhere)
+  const n = GRID_N * GRID_N;
+  let normK = 0, normIdeal = 0;
+  for (let row = 0; row < GRID_N; row++) {
+    for (let col = 0; col < GRID_N; col++) {
+      const i = row * GRID_N + col;
+      normK += K[i] * K[i];
+      if (row >= signalRow && row < signalRow + signalSize &&
+          col >= signalCol && col < signalCol + signalSize) {
+        normIdeal += signalSc * signalSc;
+      }
+    }
+  }
+  return normIdeal > 0 ? normK / normIdeal : 0;
+}
+
+// ═══════════════════════════════════════════════════════
+// MAIN APP
+// ═══════════════════════════════════════════════════════
+function App() {
+  const [phase, setPhase]       = useState('setup'); // setup | adapt | trial | iti | complete
+  const [mode, setMode]         = useState('2d');    // 2d | scatter | blocked
+
+  // Calibration / settings
+  const [distCm, setDistCm]             = useState(DEFAULT_DIST_CM);
+  const [noiseContrast, setNoiseContrast] = useState(0.4);
+  const [gaussianNoise, setGaussianNoise] = useState(false);
+  const [signalSc2d, setSignalSc2d]     = useState(0.3);  // 2D preview only
+  const [signalSize2d, setSignalSize2d] = useState(5);
+  const [signalEcc2d, setSignalEcc2d]   = useState(1.0);
+  const [trialsPerEcc, setTrialsPerEcc] = useState(150);
+  const [detectedFps, setDetectedFps]   = useState(0);
+
+  // Experiment state
+  const [eccIndex, setEccIndex]         = useState(0);
+  const [staircase, setStaircase]       = useState(null);
+  const [allResults, setAllResults]     = useState([]);
+  const [kernelTrials, setKernelTrials] = useState([]); // {seed, choseSeen, ecc}
+  const [trialCount, setTrialCount]     = useState(0);
+  const [responseEnabled, setResponseEnabled] = useState(false);
+  const [oogCount, setOogCount]         = useState(0);
+
+  const gridCanvasRef = useRef(null);
+  const trialRef      = useRef({});
+  const stimTimerRef  = useRef(null); // track flash timeout so we can cancel on unmount
+  const [L0, M0, S0]  = useMemo(() => bgToLMS0(BG_P3.r, BG_P3.g, BG_P3.b), []);
+
+  // Build gamut LUT once after L0/M0/S0 are known
+  useEffect(() => { buildGamutLUT(L0, M0, S0); }, [L0, M0, S0]);
+
+  const pxPerDeg  = distToPxPerDeg(distCm);
+  // Patch size in pixels — target ~0.4° per patch
+  const patchPx   = Math.max(4, Math.round(pxPerDeg * 0.4));
+  const gridPx    = GRID_N * patchPx;
+
+  // FPS detection
+  useEffect(() => {
+    let n = 0, t0 = performance.now();
+    const tick = now => {
+      if (++n && now - t0 >= 1000) {
+        setDetectedFps(Math.round(n * 1000 / (now - t0)));
+        n = 0; t0 = now;
+      }
+      requestAnimationFrame(tick);
+    };
+    const id = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(id);
+  }, []);
+
+  // 2D preview render
+  useEffect(() => {
+    if (phase !== 'setup' || mode !== '2d' || !gridCanvasRef.current) return;
+    const noise = generateNoise(noiseContrast, 42, gaussianNoise);
+    const ecc = signalEcc2d;
+    const sz  = signalSize2d;
+    const centre = Math.floor(GRID_N / 2);
+    const offsetPatches = Math.round(ecc / 0.4); // eccentricity in patch units
+    const signalCol = Math.min(GRID_N - sz, Math.max(0, centre + offsetPatches - Math.floor(sz/2)));
+    const signalRow = centre - Math.floor(sz/2);
+    renderGrid(gridCanvasRef.current, {
+      noise, signalSc: signalSc2d,
+      signalRow, signalCol, signalSize: sz,
+      patchPx, L0, M0, S0, showSignal: true,
+    });
+  }, [phase, mode, noiseContrast, gaussianNoise, signalSc2d, signalSize2d, signalEcc2d, patchPx, L0, M0, S0]);
+
+  // ── Run a single trial ──
+  const runTrial = useCallback((sc, ecc, sigSize) => {
+    const seed = (Math.random() * 0xFFFFFFFF) >>> 0;
+    const noise = generateNoise(noiseContrast, seed, gaussianNoise);
+
+    const centre = Math.floor(GRID_N / 2);
+    const offsetPatches = Math.round(ecc / 0.4);
+    // Always place signal to the right (fixed eccentricity mapping)
+    const signalCol = Math.min(GRID_N - sigSize, Math.max(0, centre + offsetPatches - Math.floor(sigSize/2)));
+    const signalRow = centre - Math.floor(sigSize/2);
+    const signalPresent = Math.random() > 0.5;
+
+    trialRef.current = { sc, ecc, sigSize, seed, signalPresent, signalRow, signalCol };
+    setResponseEnabled(false);
+
+    // Pre-render then flash — use direct DOM opacity to avoid React async re-render race.
+    // Pattern: render pixels → set opacity=1 synchronously → setTimeout → opacity=0 → grey fill.
+    // This ensures the observer sees exactly FLASH_MS of stimulus, no rAF/commit gap.
+    requestAnimationFrame(() => {
+      const canvas = gridCanvasRef.current;
+      if (!canvas) return;
+
+      // Render and count clamped patches in one pass (renderGrid returns oog count)
+      const oogPatches = renderGrid(canvas, {
+        noise, signalSc: sc,
+        signalRow, signalCol, signalSize: sigSize,
+        patchPx, L0, M0, S0,
+        showSignal: signalPresent,
+      });
+      if (oogPatches > 0) setOogCount(c => c + oogPatches);
+
+      // Now make canvas visible — synchronous DOM write, no React re-render needed
+      canvas.style.opacity = '1';
+
+      // After flash duration, hide and restore grey, then enable response
+      if (stimTimerRef.current) clearTimeout(stimTimerRef.current);
+      stimTimerRef.current = setTimeout(() => {
+        // Hide canvas first (synchronous), THEN overwrite pixels — avoids grey flash
+        canvas.style.opacity = '0';
+        // Use rAF to paint grey after the opacity=0 has been composited by browser
+        requestAnimationFrame(() => {
+          if (!gridCanvasRef.current) return;
+          const ctx = gridCanvasRef.current.getContext('2d');
+          ctx.fillStyle = `rgb(${BG_P3.r},${BG_P3.g},${BG_P3.b})`;
+          ctx.fillRect(0, 0, gridCanvasRef.current.width, gridCanvasRef.current.height);
+          setResponseEnabled(true);
+        });
+      }, FLASH_MS);
+    });
+  }, [noiseContrast, gaussianNoise, patchPx, L0, M0, S0]);
+
+  const handleBegin = () => {
+    const ecc = ECC_CONDITIONS[0];
+    const sigSize = SIGNAL_SIZE[ecc];
+    const sc = makeStaircase(0.3);
+    setStaircase(sc);
+    setEccIndex(0);
+    setAllResults([]);
+    setKernelTrials([]);
+    setTrialCount(0);
+    setOogCount(0);
+    setPhase('adapt');
+    setTimeout(() => {
+      setPhase('trial');
+      runTrial(sc.sc, ecc, sigSize);
+    }, ADAPT_MS);
+  };
+
+  const handleResponse = useCallback((seen) => {
+    if (!responseEnabled || phase !== 'trial') return;
+    setResponseEnabled(false);
+    if (navigator.vibrate) navigator.vibrate(8);
+
+    const { sc, ecc, sigSize, seed, signalPresent, signalRow, signalCol } = trialRef.current;
+    const choseSeen = seen;
+    const correct = choseSeen === signalPresent;
+
+    // Log kernel trial — store raw response and signal presence for correct CI computation
+    // K = mean_noise(response=yes) - mean_noise(response=no), sorted by RESPONSE not correctness
+    setKernelTrials(k => [...k, { seed, choseSeen, signalPresent, ecc, signalRow, signalCol, sigSize }]);
+    setTrialCount(c => c + 1);
+
+    // Update staircase
+    setStaircase(prev => {
+      const { nextState } = staircaseUpdate(prev, correct);
+
+      if (nextState.done || trialCount + 1 >= trialsPerEcc) {
+        // Save result for this eccentricity
+        const threshold = staircaseThreshold(nextState);
+        const sd        = staircaseSD(nextState);
+        const result = { ecc, threshold, sd, trials: nextState.trials };
+
+        const nextEcc = eccIndex + 1;
+        if (nextEcc >= ECC_CONDITIONS.length) {
+          setAllResults(r => [...r, result]);
+          setPhase('complete');
+        } else {
+          setAllResults(r => [...r, result]);
+          setEccIndex(nextEcc);
+          setTrialCount(0);
+          const newEcc     = ECC_CONDITIONS[nextEcc];
+          const newSigSize = SIGNAL_SIZE[newEcc];
+          const newSc      = makeStaircase(threshold); // warm start
+          setPhase('adapt');
+          setTimeout(() => {
+            setPhase('trial');
+            runTrial(newSc.sc, newEcc, newSigSize);
+          }, ADAPT_MS);
+          return newSc;
+        }
+      } else {
+        setTimeout(() => runTrial(nextState.sc, ecc, sigSize), 400);
+      }
+      return nextState;
+    });
+  }, [responseEnabled, phase, eccIndex, trialCount, trialsPerEcc, runTrial]);
+
+  // ═══ SETUP SCREEN ═══
+  if (phase === 'setup') {
+    const previewLabel = mode === '2d' ? 'Live preview — adjust below' : null;
+    return (
+      <div className="min-h-[100dvh] bg-[#0a0a0a] flex flex-col items-center p-4 gap-4 overflow-auto pb-10">
+        <div className="text-center pt-4">
+          <h1 className="mono text-xl font-bold text-green-400 tracking-tight">S-CONE CLASSIFIER</h1>
+          <p className="mono text-[9px] text-gray-500 mt-1 uppercase tracking-widest">
+            Classification image · SS2000 · Display P3
+          </p>
+          <p className={`mono text-[9px] mt-1 ${detectedFps >= 100 ? 'text-green-400' : 'text-yellow-500'}`}>
+            {detectedFps ? `${detectedFps} Hz` : 'Syncing...'}
+          </p>
+        </div>
+
+        {/* Mode selector */}
+        <div className="w-full max-w-sm bg-[#111] rounded-2xl border border-white/10 p-4 space-y-3">
+          <div className="mono text-[9px] text-green-600 uppercase tracking-widest">Mode</div>
+          <div className="grid grid-cols-3 gap-2">
+            {[
+              { id: '2d', label: '2D Preview' },
+              { id: 'scatter', label: '3D Scatter' },
+              { id: 'blocked', label: '3D Blocked' },
+            ].map(m => (
+              <button key={m.id} onClick={() => setMode(m.id)}
+                className={`py-2 rounded-xl mono text-[9px] border transition-all
+                  ${mode === m.id ? 'border-green-500/60 text-green-400 bg-green-500/10' : 'border-white/10 text-gray-500'}`}>
+                {m.label}
+              </button>
+            ))}
+          </div>
+          {mode === 'blocked' && (
+            <div className="mono text-[8px] text-gray-600 bg-[#1a1a1a] rounded-lg p-2">
+              Latin square: ecc × signal size × staircase direction. Generated at session start.
+            </div>
+          )}
+          {mode === 'scatter' && (
+            <div className="mono text-[8px] text-gray-600 bg-[#1a1a1a] rounded-lg p-2">
+              Signal position randomised each trial. Threshold surface interpolated post-hoc.
+            </div>
+          )}
+        </div>
+
+        {/* 2D Preview canvas */}
+        {mode === '2d' && (
+          <div className="w-full max-w-sm bg-[#111] rounded-2xl border border-white/10 p-4 space-y-3">
+            <div className="mono text-[9px] text-green-600 uppercase tracking-widest">Live Preview</div>
+            <div className="flex justify-center items-center relative"
+              style={{ background: `rgb(${BG_P3.r},${BG_P3.g},${BG_P3.b})`, borderRadius: 8, padding: 8 }}>
+              <canvas ref={gridCanvasRef}
+                style={{ display: 'block', maxWidth: '100%', imageRendering: 'pixelated' }} />
+              {/* Fixation cross overlay */}
+              <div className="fixation absolute" style={{ left: '50%', top: '50%', transform: 'translate(-50%,-50%)' }} />
+            </div>
+
+            {/* Preview controls */}
+            {[
+              { label: 'SIGNAL S CONTRAST', val: signalSc2d, set: setSignalSc2d, min: 0, max: 0.8, step: 0.01, fmt: v => v.toFixed(2) },
+              { label: 'SIGNAL ECCENTRICITY', val: signalEcc2d, set: setSignalEcc2d, min: 0.5, max: 3, step: 0.25, fmt: v => v.toFixed(2) + '°' },
+            ].map(({ label, val, set, min, max, step, fmt }) => (
+              <div key={label} className="space-y-1">
+                <div className="flex justify-between mono text-[9px] text-gray-500">
+                  <span>{label}</span><span>{fmt(val)}</span>
+                </div>
+                <input type="range" min={min} max={max} step={step} value={val}
+                  onChange={e => set(+e.target.value)} className="w-full" />
+              </div>
+            ))}
+            <div className="flex gap-2">
+              {[2].map(sz => (
+                <button key={sz} onClick={() => setSignalSize2d(sz)}
+                  className={`flex-1 py-2 rounded-lg mono text-[9px] border
+                    ${signalSize2d === sz ? 'border-green-500/60 text-green-400 bg-green-500/10' : 'border-white/10 text-gray-500'}`}>
+                  {sz}×{sz} patches (constant)
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Shared stimulus settings */}
+        <div className="w-full max-w-sm bg-[#111] rounded-2xl border border-white/10 p-4 space-y-3">
+          <div className="mono text-[9px] text-green-600 uppercase tracking-widest">Stimulus</div>
+
+          <div className="space-y-1">
+            <div className="mono text-[9px] text-gray-500 mb-1">NOISE DISTRIBUTION</div>
+            <div className="grid grid-cols-2 gap-2">
+              {[
+                { id: false, label: 'Binary circle', sub: 'max kernel SNR' },
+                { id: true,  label: 'Gaussian 2D',   sub: 'richer percept' },
+              ].map(({ id, label, sub }) => (
+                <button key={String(id)} onClick={() => setGaussianNoise(id)}
+                  className={`py-2 px-1 rounded-xl mono text-[9px] border transition-all leading-tight
+                    ${gaussianNoise === id ? 'border-green-500/60 text-green-400 bg-green-500/10' : 'border-white/10 text-gray-500'}`}>
+                  <div>{label}</div>
+                  <div className="text-[7px] opacity-60">{sub}</div>
+                </button>
+              ))}
+            </div>
+            <div className="mono text-[8px] text-gray-600">
+              {gaussianNoise ? 'N(0,σ) clipped ±3σ — more trials needed for same kernel quality' : 'Hansen & Gegenfurtner 2005 — recommended for short runs'}
+            </div>
+          </div>
+
+
+          <div className="space-y-1">
+            <div className="flex justify-between mono text-[9px] text-gray-500">
+              <span>NOISE CONTRAST</span>
+              <span>{(noiseContrast * 100).toFixed(0)}% {gaussianNoise ? '(σ, S-axis)' : '(% of gamut limit)'}</span>
+            </div>
+            <input type="range" min="0.05" max="0.8" step="0.05" value={noiseContrast}
+              onChange={e => setNoiseContrast(+e.target.value)} className="w-full" />
+            <div className="mono text-[8px] text-gray-600 text-center">
+              {gaussianNoise ? 'σ per axis — H&G recommend ≤40%' : 'Binary: gamut-scaled per angle — no clamping'}
+            </div>
+          </div>
+
+          <div className="space-y-1">
+            <div className="flex justify-between mono text-[9px] text-gray-500">
+              <span>VIEWING DISTANCE</span><span>{distCm} cm</span>
+            </div>
+            <input type="range" min="20" max="60" step="1" value={distCm}
+              onChange={e => setDistCm(+e.target.value)} className="w-full" />
+            <div className="mono text-[8px] text-gray-600 flex justify-between px-1">
+              <span>patch: {patchPx}px</span>
+              <span>grid: {gridPx}px (~{(gridPx / pxPerDeg).toFixed(1)}°)</span>
+            </div>
+          </div>
+
+          {mode !== '2d' && (
+            <div className="space-y-1">
+              <div className="flex justify-between mono text-[9px] text-gray-500">
+                <span>TRIALS PER ECCENTRICITY</span><span>{trialsPerEcc}</span>
+              </div>
+              <div className="grid grid-cols-4 gap-1">
+                {[50, 100, 150, 200].map(n => (
+                  <button key={n} onClick={() => setTrialsPerEcc(n)}
+                    className={`py-2 rounded-lg mono text-[9px] border
+                      ${trialsPerEcc === n ? 'border-green-500/60 text-green-400 bg-green-500/10' : 'border-white/10 text-gray-500'}`}>
+                    {n}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Protocol */}
+        <div className="w-full max-w-sm bg-[#0f0f0f] rounded-xl border border-white/5 p-4 mono text-[9px] text-gray-500 space-y-1">
+          <div className="text-green-600 text-[10px] mb-2">PROTOCOL</div>
+          <div>Pipeline: <span className="text-white">SS2000 · Display P3 · D65 · γ=2.2</span></div>
+          <div>Background: <span className="text-white">neutral grey rgb(128,128,128)</span></div>
+          <div>Noise: <span className="text-white">50×50 2D chromatic · full L-M/S plane · {gaussianNoise ? 'Gaussian N(0,σ)' : 'binary circle'} · DKL</span></div>
+          <div>ISI: <span className="text-white">1000ms neutral grey + fixation</span></div>
+          <div>Flash: <span className="text-white">250ms · pre-rendered</span></div>
+          <div>Eccentricities: <span className="text-white">{ECC_CONDITIONS.join('°, ')}°</span></div>
+          <div>Signal size: <span className="text-white">5×5 patches (constant — eccentricity effect is the signal)</span></div>
+          <div>Staircase: <span className="text-white">1-up 2-down · all trials (hits + correct rejections)</span></div>
+          <div>Task: <span className="text-white">yes/no · did you see a blue region?</span></div>
+          {oogCount > 0 && (
+            <div className="text-yellow-500">⚠ {oogCount} OOG patches clipped — reduce noise contrast</div>
+          )}
+        </div>
+
+        {mode === '2d' ? (
+          <div className="w-full max-w-sm bg-[#111] rounded-xl border border-green-900/30 p-3 mono text-[9px] text-green-700 text-center">
+            2D preview mode — adjust sliders to validate stimulus · no trial data collected
+          </div>
+        ) : (
+          <button disabled={!detectedFps} onClick={handleBegin}
+            className={`w-full max-w-sm py-5 rounded-2xl mono font-bold text-lg tracking-widest transition-all
+              ${!detectedFps ? 'bg-gray-800 text-gray-600' : 'bg-green-400 text-black active:scale-95'}`}>
+            BEGIN →
+          </button>
+        )}
+      </div>
+    );
+  }
+
+  // ═══ ADAPT / TRIAL SCREENS ═══
+  if (phase === 'adapt' || phase === 'trial') {
+    const ecc     = ECC_CONDITIONS[eccIndex];
+    const progress = trialCount / trialsPerEcc;
+
+    return (
+      <div className="flex flex-col h-[100dvh] w-full select-none"
+        style={{ backgroundColor: `rgb(${BG_P3.r},${BG_P3.g},${BG_P3.b})` }}>
+
+        {/* Status */}
+        <div className="flex justify-between items-center px-4 pt-3 pb-2"
+          style={{ backgroundColor: 'rgba(0,0,0,0.2)' }}>
+          <div className="mono text-[9px] text-black/50 uppercase">
+            {ecc}° · {trialCount}/{trialsPerEcc}
+          </div>
+          <div className="flex gap-1">
+            {ECC_CONDITIONS.map((e, i) => (
+              <div key={e} className="w-2 h-2 rounded-full"
+                style={{ background: i < eccIndex ? '#4ade80' : i === eccIndex ? '#facc15' : 'rgba(0,0,0,0.2)' }} />
+            ))}
+          </div>
+          <div className="mono text-[9px] text-black/50 uppercase">
+            sc={staircase?.sc.toFixed(2)} s={staircase ? Math.round(staircase.stepSize * 100) : '—'}
+          </div>
+        </div>
+
+        <div className="w-full h-[2px] bg-black/10">
+          <div className="h-full bg-black/25 transition-all" style={{ width: `${progress * 100}%` }} />
+        </div>
+
+        {/* Stimulus area */}
+        <div className="flex-1 flex items-center justify-center relative overflow-hidden">
+          <div className="relative" style={{ width: gridPx, height: gridPx }}>
+            <canvas ref={gridCanvasRef}
+              width={gridPx} height={gridPx}
+              style={{
+                display: 'block',
+                imageRendering: 'pixelated',
+                opacity: 0,
+                transition: 'none',
+              }} />
+            {/* Fixation cross always visible */}
+            <div className="fixation absolute"
+              style={{ left: '50%', top: '50%', transform: 'translate(-50%,-50%)', zIndex: 10 }} />
+          </div>
+
+          {phase === 'adapt' && (
+            <div className="absolute inset-0 flex items-center justify-center"
+              style={{ backgroundColor: `rgba(${BG_P3.r},${BG_P3.g},${BG_P3.b},0.95)` }}>
+              <div className="mono text-black/30 text-sm uppercase tracking-widest">
+                {eccIndex === 0 ? 'Fixate · Ready...' : `Next: ${ecc}°`}
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Response buttons */}
+        <div className="pb-[env(safe-area-inset-bottom)] p-4 flex gap-3">
+          <button onPointerDown={() => handleResponse(false)} disabled={!responseEnabled}
+            className={`flex-1 py-9 rounded-2xl mono font-bold text-sm tracking-widest
+              ${responseEnabled ? 'bg-black/80 text-white active:scale-95' : 'bg-black/15 text-black/25'}`}>
+            NO
+          </button>
+          <button onPointerDown={() => handleResponse(true)} disabled={!responseEnabled}
+            className={`flex-1 py-9 rounded-2xl mono font-bold text-sm tracking-widest
+              ${responseEnabled ? 'bg-black/80 text-white active:scale-95' : 'bg-black/15 text-black/25'}`}>
+            YES
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // ═══ COMPLETE SCREEN ═══
+  if (phase === 'complete') {
+    const minT = Math.min(...allResults.map(r => r.threshold));
+    const maxT = Math.max(...allResults.map(r => r.threshold));
+    const yPad = Math.max(0.05, maxT) * 1.2;
+
+    // Compute kernels
+    const kernels = ECC_CONDITIONS.map(ecc => {
+      const t = kernelTrials.filter(t => t.ecc === ecc);
+      if (t.length < 10) return null;
+      return computeKernel(t, noiseContrast, gaussianNoise);
+    });
+
+    const etas = allResults.map((r, i) => {
+      const K = kernels[i];
+      if (!K) return null;
+      const { signalRow, signalCol, sigSize } = kernelTrials.find(t => t.ecc === r.ecc) || {};
+      if (!signalRow === undefined) return null;
+      return computeEta(K, signalRow, signalCol, sigSize, r.threshold);
+    });
+
+    const saveCSV = () => {
+      const ts = new Date().toISOString().replace(/[:.]/g,'-').slice(0,19);
+      const hdr = `Eccentricity_deg,Threshold_Sc,Threshold_SD,Eta,Trials,NoiseContrast,NoiseType,DistCm,PxPerDeg,FPS\n`;
+      const body = allResults.map((r, i) =>
+        `${r.ecc},${r.threshold.toFixed(4)},${r.sd.toFixed(4)},${etas[i]?.toFixed(4)??''},${r.trials.length},${noiseContrast},${gaussianNoise?'gaussian':'binary'},${distCm},${Math.round(pxPerDeg)},${detectedFps}`
+      ).join('\n');
+      const trialDetail = `\n\nEcc,Seed,SignalPresent,ChoseSeen\n` +
+        kernelTrials.map(t => `${t.ecc},${t.seed},${t.signalPresent?1:0},${t.choseSeen?1:0}`).join('\n');
+      const blob = new Blob([hdr+body+trialDetail], {type:'text/csv'});
+      const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
+      a.download = `scone-ci-${ts}.csv`; a.click();
+    };
+
+    return (
+      <div className="min-h-[100dvh] bg-[#0a0a0a] text-white flex flex-col items-center p-6 gap-5 overflow-auto">
+        <div className="text-center pt-4">
+          <h2 className="mono text-xl font-bold text-green-400 tracking-tight">S-CONE PROFILE</h2>
+          <p className="mono text-[9px] text-gray-500 mt-1 uppercase">Detection threshold vs eccentricity</p>
+        </div>
+
+        {/* Threshold plot */}
+        <div className="w-full max-w-sm bg-[#111] rounded-2xl border border-green-900/30 p-4">
+          <div className="mono text-[9px] text-green-600 mb-3 uppercase">S-cone contrast threshold</div>
+          <div className="relative" style={{ height: 180 }}>
+            <div className="absolute bottom-0 left-8 right-0 top-0 border-l border-b border-white/10" />
+            {[0, yPad/2, yPad].map(v => (
+              <div key={v} className="absolute mono text-[7px] text-gray-600"
+                style={{ left:0, width:28, textAlign:'right', bottom:`${(v/yPad)*100}%`, transform:'translateY(50%)' }}>
+                {v.toFixed(2)}
+              </div>
+            ))}
+            {allResults.map(r => (
+              <div key={r.ecc} className="absolute mono text-[7px] text-gray-600"
+                style={{
+                  left:`calc(${((r.ecc - ECC_CONDITIONS[0]) / (ECC_CONDITIONS[ECC_CONDITIONS.length-1] - ECC_CONDITIONS[0]))*100}% + 8px)`,
+                  bottom: -16, transform:'translateX(-50%)'
+                }}>{r.ecc}°</div>
+            ))}
+            <svg className="absolute" style={{left:32,top:0,right:0,bottom:0}} viewBox="0 0 100 100" preserveAspectRatio="none">
+              <polyline
+                points={allResults.map(r => {
+                  const x = ((r.ecc - ECC_CONDITIONS[0])/(ECC_CONDITIONS[ECC_CONDITIONS.length-1]-ECC_CONDITIONS[0]))*100;
+                  const y = 100 - (r.threshold/yPad)*100;
+                  return `${x},${y}`;
+                }).join(' ')}
+                fill="none" stroke="#4ade80" strokeWidth="1.5" strokeOpacity="0.8" />
+              {allResults.map(r => {
+                const x = ((r.ecc - ECC_CONDITIONS[0])/(ECC_CONDITIONS[ECC_CONDITIONS.length-1]-ECC_CONDITIONS[0]))*100;
+                const y = 100 - (r.threshold/yPad)*100;
+                const yErr = (r.sd/yPad)*100;
+                return (
+                  <g key={r.ecc}>
+                    <line x1={x} y1={Math.max(0,y-yErr)} x2={x} y2={Math.min(100,y+yErr)}
+                      stroke="#4ade80" strokeWidth="0.8" strokeOpacity="0.3" />
+                    <circle cx={x} cy={y} r="2.5" fill="#4ade80" />
+                  </g>
+                );
+              })}
+            </svg>
+          </div>
+          <div className="flex justify-between mono text-[7px] text-gray-600 mt-6 px-8">
+            <span>{ECC_CONDITIONS[0]}°</span><span>Eccentricity →</span><span>{ECC_CONDITIONS[ECC_CONDITIONS.length-1]}°</span>
+          </div>
+          <div className="mono text-[7px] text-gray-600 mt-1 text-center">
+            Lower = more sensitive · dip at 1–1.5° = S-cone ring
+          </div>
+        </div>
+
+        {/* Results table */}
+        <div className="w-full max-w-sm bg-[#111] rounded-2xl border border-white/10 p-4">
+          <div className="mono text-[9px] text-green-600 mb-2 uppercase">Results</div>
+          <table className="w-full mono text-[9px] text-gray-400">
+            <thead>
+              <tr className="text-gray-600 border-b border-white/5">
+                <td className="pb-1">Ecc</td>
+                <td className="pb-1 text-right">Threshold</td>
+                <td className="pb-1 text-right">±SD</td>
+                <td className="pb-1 text-right">η</td>
+                <td className="pb-1 text-right">N</td>
+              </tr>
+            </thead>
+            <tbody>
+              {allResults.map((r, i) => (
+                <tr key={r.ecc} className="border-b border-white/5">
+                  <td className="py-1">{r.ecc}°</td>
+                  <td className={`py-1 text-right ${r.threshold === minT ? 'text-green-400 font-bold' : 'text-gray-300'}`}>
+                    {r.threshold.toFixed(3)}
+                  </td>
+                  <td className="py-1 text-right text-gray-500">{r.sd.toFixed(3)}</td>
+                  <td className="py-1 text-right text-gray-400">
+                    {etas[i] != null ? etas[i].toFixed(3) : '—'}
+                  </td>
+                  <td className="py-1 text-right text-gray-600">{r.trials.length}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <div className="mono text-[8px] text-gray-600 mt-2">
+            η = neural readout efficiency · kernel trials: {kernelTrials.length}
+          </div>
+          {oogCount > 0 && (
+            <div className="mono text-[8px] text-yellow-600 mt-1">
+              ⚠ {oogCount} out-of-gamut patches — consider reducing noise contrast
+            </div>
+          )}
+        </div>
+
+        <div className="w-full max-w-sm bg-[#0f0f0f] rounded-xl border border-white/5 p-3 mono text-[8px] text-gray-500">
+          SS2000 · P3 · noise {(noiseContrast*100).toFixed(0)}% · {distCm}cm · {detectedFps}Hz · OOG: {oogCount}
+        </div>
+
+        <button onClick={saveCSV}
+          className="w-full max-w-sm bg-green-400 text-black py-4 rounded-2xl mono font-bold tracking-widest active:scale-95">
+          SAVE CSV
+        </button>
+        <button onClick={() => { setPhase('setup'); setAllResults([]); setKernelTrials([]); }}
+          className="w-full max-w-sm bg-[#1a1a1a] border border-white/10 text-gray-400 py-3 rounded-2xl mono text-sm">
+          NEW SESSION
+        </button>
+      </div>
+    );
+  }
+
+  return null;
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
