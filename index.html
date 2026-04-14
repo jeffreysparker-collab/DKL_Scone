@@ -144,27 +144,18 @@ const STEP_MIN      = 0.02;
 const STEP_HALVE_UNTIL = 3;
 const SC_MAX        = 0.5;        // keep in gamut at 25% noise (0.5+0.25=0.75 linear, clips cleanly)
 
-// Eccentricity conditions — avoid 0° (tritanopic foveola)
-const ECC_CONDITIONS = [0.5, 1.0, 2.0, 3.0];
+// ─── Noise σ normalisation (H&G 2005 §2.3) ───────────────────────────────────
+// σ should be 2–5× the detection threshold so the classification image SNR is
+// adequate.  We track the running threshold estimate and update σ per eccentricity.
+// Before any threshold estimate exists we use a conservative σ = kFactor × STEP_START.
+const NOISE_SIGMA_MIN = 0.04;   // never go below (avoids invisible noise at fovea)
+const NOISE_SIGMA_MAX = 0.55;   // gamut ceiling with some headroom for signal
 
-// Constant 5×5 signal patch across all eccentricities.
-// M-scaling would flatten the threshold curve — but the eccentricity effect IS the signal here.
-// Constant size keeps the stimulus fixed so threshold differences reflect S-cone density only.
-const SIGNAL_SIZE = { 0.5: 5, 1.0: 5, 2.0: 5, 3.0: 5 };
-
-// Pixel geometry — iPhone 16 Pro
-const CSS_PX_PER_CM  = (460 / 3) / 2.54;
-const TAN_1_DEG      = Math.tan(Math.PI / 180);
-const distToPxPerDeg = d => d * CSS_PX_PER_CM * TAN_1_DEG;
-const DEFAULT_DIST_CM = 40;
-
-// ═══════════════════════════════════════════════════════
-// GAMUT BOUNDARY LUT
-// P3 gamut is highly asymmetric in DKL space — green direction clips at r≈0.116
-// while red/violet goes to r≈1.96. Pre-compute max in-gamut radius per angle
-// so binary noise can be scaled to the gamut ellipse (no clamping, max contrast).
-// Built once at module load using bgToLMS0 result.
-// ═══════════════════════════════════════════════════════
+// ─── Gamut boundary LUT ───────────────────────────────────────────────────────
+// P3 gamut is asymmetric in DKL — S+ (violet) clips much later than S− (yellow).
+// Pre-compute per-angle gamut radius so binary noise reaches the exact gamut edge
+// with no clamping needed. For pure S-axis, only θ=π/2 and θ=3π/2 are ever
+// sampled, but the full 360-entry table is cheap (~1ms) and future-proof.
 const N_GAMUT_ANGLES = 360;
 let GAMUT_RADII = null; // Float32Array, filled by buildGamutLUT()
 
@@ -185,7 +176,7 @@ function buildGamutLUT(L0, M0, S0) {
 }
 
 function gamutRadius(theta) {
-  // Bilinear interpolation in the LUT
+  // Linear interpolation in the LUT
   const t = ((theta % (2*Math.PI)) + 2*Math.PI) % (2*Math.PI);
   const idx = t / (2*Math.PI) * N_GAMUT_ANGLES;
   const i0 = Math.floor(idx) % N_GAMUT_ANGLES;
@@ -193,22 +184,36 @@ function gamutRadius(theta) {
   const frac = idx - Math.floor(idx);
   return GAMUT_RADII[i0] * (1-frac) + GAMUT_RADII[i1] * frac;
 }
+const ECC_CONDITIONS = [0.5, 1.0, 2.0, 3.0];
+
+// Constant 5×5 signal patch across all eccentricities.
+// M-scaling would flatten the threshold curve — but the eccentricity effect IS the signal here.
+// Constant size keeps the stimulus fixed so threshold differences reflect S-cone density only.
+const SIGNAL_SIZE = { 0.5: 5, 1.0: 5, 2.0: 5, 3.0: 5 };
+
+// Pixel geometry — iPhone 16 Pro
+const CSS_PX_PER_CM  = (460 / 3) / 2.54;
+const TAN_1_DEG      = Math.tan(Math.PI / 180);
+const distToPxPerDeg = d => d * CSS_PX_PER_CM * TAN_1_DEG;
+const DEFAULT_DIST_CM = 40;
 
 // ═══════════════════════════════════════════════════════
-// NOISE GENERATION — 2D chromatic (L-M plane + S axis)
-// Each patch gets an independent (lm_c, s_c) draw, producing the full
-// chromatic range seen in Hansen & Gegenfurtner 2005 (reds, greens,
-// blues, purples from the whole DKL plane).
-// Signal is added only to s_c of signal-region patches.
+// NOISE GENERATION — pure S-axis DKL (Elevation 90°, Azimuth 0°)
+// Per Hansen & Gegenfurtner 2005: noise lives exclusively on the
+// S-cone (tritanopic) confusion axis.  lm_c is always 0 so the
+// classification kernel is uncontaminated by L-M variation.
+//
+// Noise_DKL = [lm=0, s=random_S]   ← paper-correct
+// NOT:        [lm=cos(θ)·σ, s=sin(θ)·σ]  ← off-axis, mixes L-M
 //
 // Two modes:
-//   binary:   random angle θ ~ Uniform[0,2π], radius = noiseContrast
-//             → all patches on the chromatic circle, max kernel SNR
-//   gaussian: lm_c ~ N(0,σ), s_c ~ N(0,σ) independently, clipped ±3σ
-//             → varied saturation, richer percept
+//   binary:   s_c = ±noiseContrast with equal probability
+//             → maximum kernel SNR per trial (H&G recommend this)
+//   gaussian: s_c ~ N(0, noiseContrast), clipped ±3σ
+//             → softer perceptual edges, more trials needed
 //
 // Returns Float32Array length 2×GRID_N² — interleaved [lm, s, lm, s, ...]
-// Kernel computation uses only the s_c component (index 2i+1).
+// lm values are always 0; kernel uses s_c component (index 2i+1).
 // ═══════════════════════════════════════════════════════
 function generateNoise(noiseContrast, seed, gaussian = false) {
   let s = seed >>> 0;
@@ -221,27 +226,25 @@ function generateNoise(noiseContrast, seed, gaussian = false) {
   };
   const n = GRID_N * GRID_N;
   const noise = new Float32Array(n * 2); // [lm0, s0, lm1, s1, ...]
+  // lm values stay 0 throughout — pure S-axis noise per H&G 2005
   if (gaussian) {
-    // Independent Gaussian on each axis, clipped at ±3σ.
-    // No gamut scaling needed — tails are rare and bisection clamp handles them.
     const clip = 3 * noiseContrast;
     for (let i = 0; i < n; i++) {
+      // Box-Muller for S axis only
       const u1 = Math.max(1e-10, rand()), u2 = rand();
-      const z1 = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
-      const u3 = Math.max(1e-10, rand()), u4 = rand();
-      const z2 = Math.sqrt(-2 * Math.log(u3)) * Math.cos(2 * Math.PI * u4);
-      noise[i * 2]     = Math.max(-clip, Math.min(clip, z1 * noiseContrast));
-      noise[i * 2 + 1] = Math.max(-clip, Math.min(clip, z2 * noiseContrast));
+      const z  = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+      noise[i * 2]     = 0;  // lm_c = 0: no L-M contamination
+      noise[i * 2 + 1] = Math.max(-clip, Math.min(clip, z * noiseContrast));
     }
   } else {
-    // Binary: random angle, radius scaled to gamut boundary in that direction.
-    // noiseContrast (0–1) is a fraction of the per-angle gamut limit —
-    // 1.0 = maximum displayable contrast, no clamping needed by construction.
+    // Binary ±σ on S axis, scaled to the actual P3 gamut limit in each direction.
+    // S+ = θ=π/2, S− = θ=3π/2. noiseContrast (0–1) is a fraction of that limit.
+    // With the LUT, no bisection clamping is ever needed during rendering.
+    const rPos = GAMUT_RADII ? gamutRadius(Math.PI / 2)   * noiseContrast : noiseContrast;
+    const rNeg = GAMUT_RADII ? gamutRadius(3 * Math.PI / 2) * noiseContrast : noiseContrast;
     for (let i = 0; i < n; i++) {
-      const theta = rand() * 2 * Math.PI;
-      const r = gamutRadius(theta) * noiseContrast;
-      noise[i * 2]     = r * Math.cos(theta);
-      noise[i * 2 + 1] = r * Math.sin(theta);
+      noise[i * 2]     = 0;  // lm_c = 0: no L-M contamination
+      noise[i * 2 + 1] = rand() < 0.5 ? -rNeg : rPos;
     }
   }
   return noise;
@@ -273,7 +276,8 @@ function renderGrid(canvas, {
   for (let row = 0; row < GRID_N; row++) {
     for (let col = 0; col < GRID_N; col++) {
       const idx = row * GRID_N + col;
-      let lm_c = noise[idx * 2];
+      // lm_c is always 0 (pure S-axis noise), enforced: no L-M contamination anywhere
+      const lm_c = 0;
       let s_c  = noise[idx * 2 + 1];
 
       if (showSignal &&
@@ -289,7 +293,7 @@ function renderGrid(canvas, {
         let lo = 0, hi = 1;
         for (let k = 0; k < 8; k++) {
           const mid = (lo + hi) / 2;
-          const res = dklPatchToP3(L0, M0, S0, lm_c * mid, s_c * mid);
+          const res = dklPatchToP3(L0, M0, S0, 0, s_c * mid);
           if (res.oog) hi = mid; else { lo = mid; r = res.r; g = res.g; b = res.b; }
         }
       }
@@ -426,13 +430,16 @@ function App() {
 
   // Calibration / settings
   const [distCm, setDistCm]             = useState(DEFAULT_DIST_CM);
-  const [noiseContrast, setNoiseContrast] = useState(0.4);
+  const [noiseKFactor, setNoiseKFactor] = useState(3);    // σ = k × threshold (H&G: 2–5×)
   const [gaussianNoise, setGaussianNoise] = useState(false);
   const [signalSc2d, setSignalSc2d]     = useState(0.3);  // 2D preview only
   const [signalSize2d, setSignalSize2d] = useState(5);
   const [signalEcc2d, setSignalEcc2d]   = useState(1.0);
   const [trialsPerEcc, setTrialsPerEcc] = useState(150);
   const [detectedFps, setDetectedFps]   = useState(0);
+  // Running noise σ — updated after each eccentricity from staircase threshold.
+  // Initialised to k × STEP_START as a pre-experiment estimate.
+  const [noiseSigma, setNoiseSigma]     = useState(noiseKFactor * STEP_START);
 
   // Experiment state
   const [eccIndex, setEccIndex]         = useState(0);
@@ -448,7 +455,7 @@ function App() {
   const stimTimerRef  = useRef(null); // track flash timeout so we can cancel on unmount
   const [L0, M0, S0]  = useMemo(() => bgToLMS0(BG_P3.r, BG_P3.g, BG_P3.b), []);
 
-  // Build gamut LUT once after L0/M0/S0 are known
+  // Build gamut LUT once — needed before first trial so binary noise gets correct radii
   useEffect(() => { buildGamutLUT(L0, M0, S0); }, [L0, M0, S0]);
 
   const pxPerDeg  = distToPxPerDeg(distCm);
@@ -473,7 +480,7 @@ function App() {
   // 2D preview render
   useEffect(() => {
     if (phase !== 'setup' || mode !== '2d' || !gridCanvasRef.current) return;
-    const noise = generateNoise(noiseContrast, 42, gaussianNoise);
+    const noise = generateNoise(noiseSigma, 42, gaussianNoise);
     const ecc = signalEcc2d;
     const sz  = signalSize2d;
     const centre = Math.floor(GRID_N / 2);
@@ -485,12 +492,12 @@ function App() {
       signalRow, signalCol, signalSize: sz,
       patchPx, L0, M0, S0, showSignal: true,
     });
-  }, [phase, mode, noiseContrast, gaussianNoise, signalSc2d, signalSize2d, signalEcc2d, patchPx, L0, M0, S0]);
+  }, [phase, mode, noiseSigma, gaussianNoise, signalSc2d, signalSize2d, signalEcc2d, patchPx, L0, M0, S0]);
 
   // ── Run a single trial ──
   const runTrial = useCallback((sc, ecc, sigSize) => {
     const seed = (Math.random() * 0xFFFFFFFF) >>> 0;
-    const noise = generateNoise(noiseContrast, seed, gaussianNoise);
+    const noise = generateNoise(noiseSigma, seed, gaussianNoise);
 
     const centre = Math.floor(GRID_N / 2);
     const offsetPatches = Math.round(ecc / 0.4);
@@ -499,7 +506,7 @@ function App() {
     const signalRow = centre - Math.floor(sigSize/2);
     const signalPresent = Math.random() > 0.5;
 
-    trialRef.current = { sc, ecc, sigSize, seed, signalPresent, signalRow, signalCol };
+    trialRef.current = { sc, ecc, sigSize, seed, signalPresent, signalRow, signalCol, noiseSigma };
     setResponseEnabled(false);
 
     // Pre-render then flash — use direct DOM opacity to avoid React async re-render race.
@@ -509,7 +516,7 @@ function App() {
       const canvas = gridCanvasRef.current;
       if (!canvas) return;
 
-      // Render and count clamped patches in one pass (renderGrid returns oog count)
+      // Render stimulus and count OOG patches in one pass (renderGrid returns count)
       const oogPatches = renderGrid(canvas, {
         noise, signalSc: sc,
         signalRow, signalCol, signalSize: sigSize,
@@ -536,12 +543,14 @@ function App() {
         });
       }, FLASH_MS);
     });
-  }, [noiseContrast, gaussianNoise, patchPx, L0, M0, S0]);
+  }, [noiseSigma, gaussianNoise, patchPx, L0, M0, S0]);
 
   const handleBegin = () => {
     const ecc = ECC_CONDITIONS[0];
     const sigSize = SIGNAL_SIZE[ecc];
     const sc = makeStaircase(0.3);
+    const initSigma = Math.max(NOISE_SIGMA_MIN, Math.min(NOISE_SIGMA_MAX, noiseKFactor * STEP_START));
+    setNoiseSigma(initSigma);
     setStaircase(sc);
     setEccIndex(0);
     setAllResults([]);
@@ -566,7 +575,7 @@ function App() {
 
     // Log kernel trial — store raw response and signal presence for correct CI computation
     // K = mean_noise(response=yes) - mean_noise(response=no), sorted by RESPONSE not correctness
-    setKernelTrials(k => [...k, { seed, choseSeen, signalPresent, ecc, signalRow, signalCol, sigSize }]);
+    setKernelTrials(k => [...k, { seed, choseSeen, signalPresent, ecc, signalRow, signalCol, sigSize, noiseSigma }]);
     setTrialCount(c => c + 1);
 
     // Update staircase
@@ -590,6 +599,9 @@ function App() {
           const newEcc     = ECC_CONDITIONS[nextEcc];
           const newSigSize = SIGNAL_SIZE[newEcc];
           const newSc      = makeStaircase(threshold); // warm start
+          // Update σ = k × new threshold estimate (H&G 2005: σ ≈ 2–5× threshold)
+          const newSigma = Math.max(NOISE_SIGMA_MIN, Math.min(NOISE_SIGMA_MAX, noiseKFactor * threshold));
+          setNoiseSigma(newSigma);
           setPhase('adapt');
           setTimeout(() => {
             setPhase('trial');
@@ -602,7 +614,7 @@ function App() {
       }
       return nextState;
     });
-  }, [responseEnabled, phase, eccIndex, trialCount, trialsPerEcc, runTrial]);
+  }, [responseEnabled, phase, eccIndex, trialCount, trialsPerEcc, noiseKFactor, runTrial]);
 
   // ═══ SETUP SCREEN ═══
   if (phase === 'setup') {
@@ -692,8 +704,8 @@ function App() {
             <div className="mono text-[9px] text-gray-500 mb-1">NOISE DISTRIBUTION</div>
             <div className="grid grid-cols-2 gap-2">
               {[
-                { id: false, label: 'Binary circle', sub: 'max kernel SNR' },
-                { id: true,  label: 'Gaussian 2D',   sub: 'richer percept' },
+                { id: false, label: 'Binary ±σ', sub: 'max kernel SNR' },
+                { id: true,  label: 'Gaussian S', sub: 'softer edges' },
               ].map(({ id, label, sub }) => (
                 <button key={String(id)} onClick={() => setGaussianNoise(id)}
                   className={`py-2 px-1 rounded-xl mono text-[9px] border transition-all leading-tight
@@ -704,21 +716,28 @@ function App() {
               ))}
             </div>
             <div className="mono text-[8px] text-gray-600">
-              {gaussianNoise ? 'N(0,σ) clipped ±3σ — more trials needed for same kernel quality' : 'Hansen & Gegenfurtner 2005 — recommended for short runs'}
+              {gaussianNoise ? 'N(0,σ) on S axis only — more trials for same kernel quality' : 'Binary ±σ on S axis — H&G 2005 recommended for short runs'}
             </div>
           </div>
 
-
           <div className="space-y-1">
             <div className="flex justify-between mono text-[9px] text-gray-500">
-              <span>NOISE CONTRAST</span>
-              <span>{(noiseContrast * 100).toFixed(0)}% {gaussianNoise ? '(σ, S-axis)' : '(% of gamut limit)'}</span>
+              <span>NOISE σ = k × THRESHOLD</span>
+              <span className="text-green-400">σ ≈ {noiseSigma.toFixed(3)}</span>
             </div>
-            <input type="range" min="0.05" max="0.8" step="0.05" value={noiseContrast}
-              onChange={e => setNoiseContrast(+e.target.value)} className="w-full" />
-            <div className="mono text-[8px] text-gray-600 text-center">
-              {gaussianNoise ? 'σ per axis — H&G recommend ≤40%' : 'Binary: gamut-scaled per angle — no clamping'}
+            <div className="grid grid-cols-4 gap-1">
+              {[2, 3, 4, 5].map(k => (
+                <button key={k} onClick={() => {
+                    setNoiseKFactor(k);
+                    setNoiseSigma(Math.max(NOISE_SIGMA_MIN, Math.min(NOISE_SIGMA_MAX, k * STEP_START)));
+                  }}
+                  className={`py-2 rounded-lg mono text-[9px] border
+                    ${noiseKFactor === k ? 'border-green-500/60 text-green-400 bg-green-500/10' : 'border-white/10 text-gray-500'}`}>
+                  k={k}
+                </button>
+              ))}
             </div>
+            <div className="mono text-[8px] text-gray-600 text-center">H&amp;G 2005: σ ≈ 2–5× threshold · updates per eccentricity · binary mode gamut-scaled</div>
           </div>
 
           <div className="space-y-1">
@@ -756,7 +775,8 @@ function App() {
           <div className="text-green-600 text-[10px] mb-2">PROTOCOL</div>
           <div>Pipeline: <span className="text-white">SS2000 · Display P3 · D65 · γ=2.2</span></div>
           <div>Background: <span className="text-white">neutral grey rgb(128,128,128)</span></div>
-          <div>Noise: <span className="text-white">50×50 2D chromatic · full L-M/S plane · {gaussianNoise ? 'Gaussian N(0,σ)' : 'binary circle'} · DKL</span></div>
+          <div>Noise: <span className="text-white">50×50 · pure S-axis DKL (elev 90°, az 0°) · {gaussianNoise ? 'Gaussian N(0,σ)' : 'binary ±σ'} · σ={noiseSigma.toFixed(3)}</span></div>
+          <div>σ rule: <span className="text-white">σ = {noiseKFactor}× threshold · updated per eccentricity (H&amp;G 2005)</span></div>
           <div>ISI: <span className="text-white">1000ms neutral grey + fixation</span></div>
           <div>Flash: <span className="text-white">250ms · pre-rendered</span></div>
           <div>Eccentricities: <span className="text-white">{ECC_CONDITIONS.join('°, ')}°</span></div>
@@ -862,11 +882,13 @@ function App() {
     const maxT = Math.max(...allResults.map(r => r.threshold));
     const yPad = Math.max(0.05, maxT) * 1.2;
 
-    // Compute kernels
+    // Compute kernels — regenerate noise using the σ that was active for each trial
     const kernels = ECC_CONDITIONS.map(ecc => {
       const t = kernelTrials.filter(t => t.ecc === ecc);
       if (t.length < 10) return null;
-      return computeKernel(t, noiseContrast, gaussianNoise);
+      // All trials within one eccentricity block share the same σ (updated once per block)
+      const sigma = t[0].noiseSigma ?? noiseSigma;
+      return computeKernel(t, sigma, gaussianNoise);
     });
 
     const etas = allResults.map((r, i) => {
@@ -879,10 +901,11 @@ function App() {
 
     const saveCSV = () => {
       const ts = new Date().toISOString().replace(/[:.]/g,'-').slice(0,19);
-      const hdr = `Eccentricity_deg,Threshold_Sc,Threshold_SD,Eta,Trials,NoiseContrast,NoiseType,DistCm,PxPerDeg,FPS\n`;
-      const body = allResults.map((r, i) =>
-        `${r.ecc},${r.threshold.toFixed(4)},${r.sd.toFixed(4)},${etas[i]?.toFixed(4)??''},${r.trials.length},${noiseContrast},${gaussianNoise?'gaussian':'binary'},${distCm},${Math.round(pxPerDeg)},${detectedFps}`
-      ).join('\n');
+      const hdr = `Eccentricity_deg,Threshold_Sc,Threshold_SD,Eta,Trials,NoiseSigma,NoiseKFactor,NoiseType,DistCm,PxPerDeg,FPS\n`;
+      const body = allResults.map((r, i) => {
+        const trialSigma = (kernelTrials.find(t => t.ecc === r.ecc)?.noiseSigma ?? noiseSigma).toFixed(4);
+        return `${r.ecc},${r.threshold.toFixed(4)},${r.sd.toFixed(4)},${etas[i]?.toFixed(4)??''},${r.trials.length},${trialSigma},${noiseKFactor},${gaussianNoise?'gaussian':'binary'},${distCm},${Math.round(pxPerDeg)},${detectedFps}`;
+      }).join('\n');
       const trialDetail = `\n\nEcc,Seed,SignalPresent,ChoseSeen\n` +
         kernelTrials.map(t => `${t.ecc},${t.seed},${t.signalPresent?1:0},${t.choseSeen?1:0}`).join('\n');
       const blob = new Blob([hdr+body+trialDetail], {type:'text/csv'});
@@ -985,7 +1008,7 @@ function App() {
         </div>
 
         <div className="w-full max-w-sm bg-[#0f0f0f] rounded-xl border border-white/5 p-3 mono text-[8px] text-gray-500">
-          SS2000 · P3 · noise {(noiseContrast*100).toFixed(0)}% · {distCm}cm · {detectedFps}Hz · OOG: {oogCount}
+          SS2000 · P3 · pure S-axis · σ={noiseSigma.toFixed(3)} (k={noiseKFactor}×T) · {distCm}cm · {detectedFps}Hz · OOG: {oogCount}
         </div>
 
         <button onClick={saveCSV}
